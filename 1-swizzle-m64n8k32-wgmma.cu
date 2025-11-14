@@ -17,18 +17,14 @@ typedef __nv_bfloat16 bf16;
 ////////////////////////////////////////////////////////////////////////////////
 // Part 0: 64B Swizzle WGGMA load for M = 64, N = 8, K = 32
 ////////////////////////////////////////////////////////////////////////////////
-
 template <int TILE_M, int TILE_N, int TILE_K>
 __global__ void swizzle_wgmma_m64n8k32(bf16 *a, bf16 *b, float *c) {
-
-    // <--- your code here --->
 
 }
 
 template <int TILE_M, int TILE_N, int TILE_K>
 void launch_swizzle_wgmma_m64n8k32(bf16 *a, bf16 *b, float *c) {
-
-    // <--- your code here --->
+    swizzle_wgmma_m64n8k32<TILE_M, TILE_N, TILE_K><<<1, 128>>>(a, b, c);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
