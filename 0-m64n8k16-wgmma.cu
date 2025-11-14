@@ -21,14 +21,55 @@ typedef __nv_bfloat16 bf16;
 template <int TILE_M, int TILE_N, int TILE_K>
 __global__ void wgmma_m64n8k16(bf16 *a, bf16 *b, float *c) {
 
-    // <--- your code here --->
+    __shared__ bf16 smem_a[TILE_M * TILE_K];  // 64 x 16
+    __shared__ bf16 smem_b[TILE_K * TILE_N]; // 16 x 8
+
+    int tid = threadIdx.x;
+
+    for (int i = tid; i < TILE_M * TILE_K; i += blockDim.x) {
+        smem_a[i] = a[i];
+    }
+
+    for (int i = tid; i < TILE_K * TILE_N; i += blockDim.x) {
+        smem_b[i] = b[(i % TILE_K) * TILE_N + (i / TILE_K)];
+        //smem_b[i] = b[i];
+    }
+
+    __syncthreads();
+
+    uint64_t a_desc = make_smem_desc<NO_SWIZZLE>(smem_a, 128, 256);
+    uint64_t b_desc = make_smem_desc<NO_SWIZZLE>(smem_b, 128, 128);
+
+    float acc[4] = {0.0f};
+
+    warpgroup_arrive();
+
+    wgmma_n8<1, 1, 1, 0, 0>(a_desc, b_desc, acc);
+
+    wgmma_commit();
+    wgmma_wait<0>();
+
+    // need to write acc valuies back in to c
+    for (int i = 0; i < 4; i++) {
+        c[(tid % 32 ) / 4 + (tid / 32) * 16 + (tid % 4)*128 + (i%2)*64 + (i/2)*8] = acc[i];
+    }
+
+
+    __syncthreads();
+
+    for (int i = 0; i < 64; i++) {
+        for (int j = 0; j < 8; j++) {
+            if (tid == 0) { 
+                printf("c[%d, %d] = %.0f\n", i, j, c[j * 64 + i]);
+            }
+        }
+    }
 
 } 
 
 template <int TILE_M, int TILE_N, int TILE_K>
 void launch_wgmma_m64n8k16(bf16 *a, bf16 *b, float *c) {
-    
-    // <--- your code here --->
+    wgmma_m64n8k16<TILE_M, TILE_N, TILE_K><<<1, 128>>>(a, b, c);
 
 }
 
@@ -75,6 +116,12 @@ int main() {
                 temp += a_row * a_col;
             }
             cpu_output[j * M + i] = temp;
+        }
+    }
+
+    for (int i = 0; i < 64; i++) {
+        for (int j = 0; j < 8; j++) {
+            printf("cpu_output[%d, %d] = %.0f\n", i, j, cpu_output[j * 64 + i]);
         }
     }
 
