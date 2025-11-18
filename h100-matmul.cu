@@ -1,5 +1,5 @@
 // TL+ {"platform": "h100"}
-// TL+ {"header_files": ["tma-interface.cuh", "wgmma-interface.cuh", "kernel.cu"]}
+// TL+ {"header_files": ["tma-interface.cuh", "wgmma-interface.cuh"]}
 // TL+ {"compile_flags": ["-lcuda", "-lcublas"]}
 
 #include <algorithm>
