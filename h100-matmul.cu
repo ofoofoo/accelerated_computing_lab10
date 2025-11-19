@@ -16,16 +16,71 @@ typedef __nv_bfloat16 bf16;
 // Part 1: Matrix Multiplication for M = 8192, N = 8192, K = 8192
 ////////////////////////////////////////////////////////////////////////////////
 
+#define THREADS_PER_BLOCK 128
 
-__global__ void h100_matmul() {
+__global__ void h100_matmul(
+    __grid_constant__ const CUtensorMap a,
+    __grid_constant__ const CUtensorMap b,
+    float *c
+) {
+    extern __shared__ uint8_t shmem[];
 
+    uint64_t* bar_A = reinterpret_cast<uint64_t*>(shmem);
+    uint64_t* bar_B = reinterpret_cast<uint64_t*>(shmem + 8);
+
+    int tid = threadIdx.x;
+
+    if (tid == 0) {
+        init_barrier()
+    }
     // <--- your code here --->
 
 }
 
 void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
+    CUtensorMap a_map;
+    CUtensorMap b_map;
 
+    // A is 64x32
+    const cuuint64_t global_dim_a[2] = {TILE_K, TILE_M};
+    const cuuint64_t global_strides_a[2] = {TILE_K * sizeof(bf16)};
+    const cuuint32_t box_dim_a[2] = {TILE_K, TILE_M};
+    const cuuint32_t element_strides_a[2] = {1, 1};
+
+    cuTensorMapEncodeTiled(
+        &CUtensorMapA, 
+        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 
+        2, 
+        a, 
+        global_dim_a,
+        global_strides_a, 
+        box_dim_a, 
+        element_strides_a,
+        CU_TENSOR_MAP_INTERLEAVE_NONE, 
+        CU_TENSOR_MAP_SWIZZLE_64B,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE, 
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+    );
+
+    // each block does 64x256 output tile, similar to lab 4
+    // within each block: there are 2 WARPGROUPS: 1 producer 1 consudmer, walk along k dimension
+    // write into registers to accumulate results accordingly
+    // use write TMA to write back results to global memory
+    // extend to 1 producer 2 consumer later
+
+
+    // 1 producer 2 consumers: need ot make sure that when a consumer arrives at a point when TMA is ready, 
+    // swizzle with 128B needed: adds like 100 TFLOPs of gain, use 256 WGMMA
     // <--- your code here --->
+
+    size_t shared_bytes = ;
+
+    dim3 grid();
+    h100_matmul<<<grid, THREADS_PER_BLOCK, shared_bytes>>>(
+        a_map,
+        b_map,
+        reinterpret_cast<float *>(C)
+    );
 
 }
 
