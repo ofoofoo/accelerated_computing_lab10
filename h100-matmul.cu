@@ -16,9 +16,9 @@ typedef __nv_bfloat16 bf16;
 // Part 1: Matrix Multiplication for M = 8192, N = 8192, K = 8192
 ////////////////////////////////////////////////////////////////////////////////
 #define THREADS_PER_BLOCK 128
-#define TILE_M 64
+#define TILE_M 128
 #define TILE_N 256
-#define TILE_K 16
+#define TILE_K 64
 
 __global__ void h100_matmul(
     __grid_constant__ const CUtensorMap a_map,
@@ -46,9 +46,9 @@ __global__ void h100_matmul(
     if (tid == 0) {
         init_barrier(bar_A, 1);
         init_barrier(bar_B, 1);
-        async_proxy_fence();
     }
     __syncthreads();
+    async_proxy_fence();
 
     float acc[16][8];
     for (int i = 0; i < 16; i++) {
@@ -65,12 +65,19 @@ __global__ void h100_matmul(
         if (tid == 0) {
             expect_bytes(bar_A, TILE_M * TILE_K * sizeof(bf16));
             expect_bytes(bar_B, TILE_K * TILE_N * sizeof(bf16));
+
+            int coord_k = k_tile * TILE_K;
+            int coord_m = block_m * TILE_M;
+            int coord_n = block_n * TILE_N;
             
+            // A is K-major (K, M), so coordinates are (k_tile, block_m)
             cp_async_bulk_tensor_2d_global_to_shared(
-                smem_A, &a_map, k_tile, block_m, bar_A
+                smem_A, &a_map, coord_k, coord_m, bar_A
             );
+            
+            // B is K-major (K, N), so coordinates are (k_tile, block_n)
             cp_async_bulk_tensor_2d_global_to_shared(
-                smem_B, &b_map, k_tile, block_n, bar_B
+                smem_B, &b_map, coord_k, coord_n, bar_B
             );
             
             arrive(bar_A, 1);
@@ -86,7 +93,7 @@ __global__ void h100_matmul(
         __syncthreads();
         warpgroup_arrive();
 
-        uint64_t desc_a = make_smem_desc<SWIZZLE_128B>(smem_A, 0, 1024);
+        uint64_t desc_a = make_smem_desc<SWIZZLE_128B>(smem_A, 0, 512);
         uint64_t desc_b = make_smem_desc<SWIZZLE_128B>(smem_B, 0, 0);
 
         wgmma_n256<1, 1, 1, 0, 0>(desc_a, desc_b, acc);
