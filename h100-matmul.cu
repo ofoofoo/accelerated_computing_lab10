@@ -15,76 +15,160 @@ typedef __nv_bfloat16 bf16;
 ////////////////////////////////////////////////////////////////////////////////
 // Part 1: Matrix Multiplication for M = 8192, N = 8192, K = 8192
 ////////////////////////////////////////////////////////////////////////////////
-
 #define THREADS_PER_BLOCK 128
+#define TILE_M 64
+#define TILE_N 256
+#define TILE_K 16
 
 __global__ void h100_matmul(
-    __grid_constant__ const CUtensorMap a,
-    __grid_constant__ const CUtensorMap b,
+    __grid_constant__ const CUtensorMap a_map,
+    __grid_constant__ const CUtensorMap b_map,
     float *c
 ) {
     extern __shared__ uint8_t shmem[];
 
     uint64_t* bar_A = reinterpret_cast<uint64_t*>(shmem);
     uint64_t* bar_B = reinterpret_cast<uint64_t*>(shmem + 8);
+    
+    uintptr_t tensor_base = reinterpret_cast<uintptr_t>(shmem + 16);
+    tensor_base = (tensor_base + 127) & ~127ULL;
+    
+    bf16* smem_A = reinterpret_cast<bf16*>(tensor_base);
+    bf16* smem_B = smem_A + TILE_M * TILE_K;
 
     int tid = threadIdx.x;
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+
+    int block_m = blockIdx.y;
+    int block_n = blockIdx.x;
 
     if (tid == 0) {
-        init_barrier()
+        init_barrier(bar_A, 1);
+        init_barrier(bar_B, 1);
+        async_proxy_fence();
     }
-    // <--- your code here --->
+    __syncthreads();
 
+    float acc[16][8];
+    for (int i = 0; i < 16; i++) {
+        for (int j = 0; j < 8; j++) {
+            acc[i][j] = 0.0f;
+        }
+    }
+
+    int num_k_tiles = 8192 / TILE_K;
+    int phase_A = 0;
+    int phase_B = 0;
+    
+    for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) {
+        if (tid == 0) {
+            expect_bytes(bar_A, TILE_M * TILE_K * sizeof(bf16));
+            expect_bytes(bar_B, TILE_K * TILE_N * sizeof(bf16));
+            
+            cp_async_bulk_tensor_2d_global_to_shared(
+                smem_A, &a_map, k_tile, block_m, bar_A
+            );
+            cp_async_bulk_tensor_2d_global_to_shared(
+                smem_B, &b_map, k_tile, block_n, bar_B
+            );
+            
+            arrive(bar_A, 1);
+            arrive(bar_B, 1);
+        }
+
+        wait(bar_A, phase_A);
+        wait(bar_B, phase_B);
+        
+        phase_A ^= 1;
+        phase_B ^= 1;
+
+        __syncthreads();
+        warpgroup_arrive();
+
+        uint64_t desc_a = make_smem_desc<SWIZZLE_128B>(smem_A, 0, 1024);
+        uint64_t desc_b = make_smem_desc<SWIZZLE_128B>(smem_B, 0, 0);
+
+        wgmma_n256<1, 1, 1, 0, 0>(desc_a, desc_b, acc);
+        wgmma_commit();
+        wgmma_wait<0>();
+
+        __syncthreads();
+    }
+
+    // writeback
 }
 
 void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
     CUtensorMap a_map;
     CUtensorMap b_map;
 
-    // A is 64x32
-    const cuuint64_t global_dim_a[2] = {TILE_K, TILE_M};
-    const cuuint64_t global_strides_a[2] = {TILE_K * sizeof(bf16)};
+    const cuuint64_t global_dim_a[2] = {(cuuint64_t)K, (cuuint64_t)M};
+    const cuuint64_t global_strides_a[1] = {(cuuint64_t)(K * sizeof(bf16))};
     const cuuint32_t box_dim_a[2] = {TILE_K, TILE_M};
     const cuuint32_t element_strides_a[2] = {1, 1};
 
     cuTensorMapEncodeTiled(
-        &CUtensorMapA, 
-        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 
-        2, 
-        a, 
+        &a_map,
+        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        2,
+        A,
         global_dim_a,
-        global_strides_a, 
-        box_dim_a, 
+        global_strides_a,
+        box_dim_a,
         element_strides_a,
-        CU_TENSOR_MAP_INTERLEAVE_NONE, 
-        CU_TENSOR_MAP_SWIZZLE_64B,
-        CU_TENSOR_MAP_L2_PROMOTION_NONE, 
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_128B,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE,
         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
     );
 
-    // each block does 64x256 output tile, similar to lab 4
-    // within each block: there are 2 WARPGROUPS: 1 producer 1 consudmer, walk along k dimension
-    // write into registers to accumulate results accordingly
-    // use write TMA to write back results to global memory
-    // extend to 1 producer 2 consumer later
+    const cuuint64_t global_dim_b[2] = {(cuuint64_t)K, (cuuint64_t)N};
+    const cuuint64_t global_strides_b[1] = {(cuuint64_t)(K * sizeof(bf16))};
+    const cuuint32_t box_dim_b[2] = {TILE_K, TILE_N};
+    const cuuint32_t element_strides_b[2] = {1, 1};
 
+    cuTensorMapEncodeTiled(
+        &b_map,
+        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        2,
+        B,
+        global_dim_b,
+        global_strides_b,
+        box_dim_b,
+        element_strides_b,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_128B,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+    );
 
-    // 1 producer 2 consumers: need ot make sure that when a consumer arrives at a point when TMA is ready, 
-    // swizzle with 128B needed: adds like 100 TFLOPs of gain, use 256 WGMMA
-    // <--- your code here --->
+    size_t shared_bytes = (TILE_M * TILE_K + TILE_K * TILE_N) * sizeof(bf16) + 16 + 128;
 
-    size_t shared_bytes = ;
+    int tile_m = (M + TILE_M - 1) / TILE_M;
+    int tile_n = (N + TILE_N - 1) / TILE_N;
+    dim3 grid(tile_n, tile_m);
 
-    dim3 grid();
+    CUDA_CHECK(cudaFuncSetAttribute(
+        h100_matmul,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        96000));
+    
     h100_matmul<<<grid, THREADS_PER_BLOCK, shared_bytes>>>(
         a_map,
         b_map,
         reinterpret_cast<float *>(C)
     );
-
 }
 
-/// <--- your code here --->
+// each block does 64x256 output tile, similar to lab 4
+// within each block: there are 2 WARPGROUPS: 1 producer 1 consudmer, walk along k dimension
+// write into registers to accumulate results accordingly
+// use write TMA to write back results to global memory
+// extend to 1 producer 2 consumer later
+
+// 1 producer 2 consumers: need ot make sure that when a consumer arrives at a point when TMA is ready, 
+// swizzle with 128B needed: adds like 100 TFLOPs of gain, use 256 WGMMA
 
 ////////////////////////////////////////////////////////////////////////////////
 ///          YOU DO NOT NEED TO MODIFY THE CODE BELOW HERE.                  ///
