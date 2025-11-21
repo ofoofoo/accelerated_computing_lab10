@@ -117,15 +117,15 @@ __global__ void h100_matmul(
     }
 
 // writeback - convert float to bf16
+// Potential alternative writeback based on reference pattern
 for (int i = 0; i < 16; i++) {
     for (int j = 0; j < 8; j++) {
-        int local_row = (tid % 4) * 16 + i;
-        int local_col = (tid / 4) * 8 + j;
+        int row = (tid % 4) + (i / 4) * 4 + (tid / 32) * 16;
+        int col = (tid % 32) / 4 * 8 + (i % 4) * 2 + j;
         
-        int global_m = block_m * TILE_M + local_row;
-        int global_n = block_n * TILE_N + local_col;
+        int global_m = block_m * TILE_M + row;
+        int global_n = block_n * TILE_N + col;
         
-        // Convert float to bf16 before writing
         c[global_m * 8192 + global_n] = __float2bfloat16(acc[i][j]);
     }
 }
