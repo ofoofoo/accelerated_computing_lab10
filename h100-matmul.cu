@@ -116,7 +116,6 @@ __global__ void h100_matmul(
         __syncthreads();
     }
 
-    // writeback
 // writeback - convert float to bf16
 for (int i = 0; i < 16; i++) {
     for (int j = 0; j < 8; j++) {
@@ -270,6 +269,7 @@ void init_matrix(bf16 *mat, int N) {
 bool check_correctness(bf16 *ref, bf16 *test, int N, float tolerance = 0.1f) {
     int mismatches = 0;
     int total = N;
+
     for (int i = 0; i < N; i++) {
         float ref_val = __bfloat162float(ref[i]);
         float test_val = __bfloat162float(test[i]);
@@ -286,6 +286,36 @@ bool check_correctness(bf16 *ref, bf16 *test, int N, float tolerance = 0.1f) {
     std::cout << "Total mismatches: " << mismatches << " / " << total << " ("
               << (100.0 * mismatches / total) << "%)" << std::endl;
     return mismatches == 0;
+}
+
+bool check_permutation_subset(bf16 *ref, bf16 *test, int N, int num_samples = 100, float tolerance = 0.1f) {
+    std::cout << "\n=== Checking if ref values exist in test ===" << std::endl;
+    
+    int found = 0;
+    for (int sample = 0; sample < num_samples; sample++) {
+        int ref_idx = sample;
+        float ref_val = __bfloat162float(ref[ref_idx]);
+        
+        // Search for this value anywhere in test
+        bool found_match = false;
+        for (int test_idx = 0; test_idx < N; test_idx++) {
+            float test_val = __bfloat162float(test[test_idx]);
+            if (std::abs(test_val - ref_val) <= tolerance) {
+                found_match = true;
+                std::cout << "  ref[" << ref_idx << "]=" << ref_val 
+                          << " found at test[" << test_idx << "]" << std::endl;
+                break;
+            }
+        }
+        if (found_match) found++;
+        else {
+            std::cout << "  ref[" << ref_idx << "]=" << ref_val 
+                      << " NOT FOUND in test ✗" << std::endl;
+        }
+    }
+    
+    std::cout << "Found " << found << "/" << num_samples << " ref values in test" << std::endl;
+    return found == num_samples;
 }
 
 int main() {
@@ -330,6 +360,9 @@ int main() {
 
     bool correct = check_correctness(hCublas, hOurs, M * N, 0.01f);
     printf("%s output!\n\n\n", correct ? "Correct" : "Incorrect");
+
+    bool permutation_subset = check_permutation_subset(hCublas, hOurs, M * N, 1000, 0.01f);
+    printf("%s permutation subset output!\n\n\n", permutation_subset ? "Correct" : "Incorrect");
 
     long flops = 2LL * M * N * K;
     BENCHPRESS(runCublasRef, flops, M, N, K, dA, dB, dCublas);
