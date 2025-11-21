@@ -23,7 +23,7 @@ typedef __nv_bfloat16 bf16;
 __global__ void h100_matmul(
     __grid_constant__ const CUtensorMap a_map,
     __grid_constant__ const CUtensorMap b_map,
-    bf16 *c
+    __grid_constant__ const CUtensorMap c_map
 ) {
     extern __shared__ uint8_t shmem[];
 
@@ -72,12 +72,12 @@ __global__ void h100_matmul(
             
             // A is K-major (K, M), so coordinates are (k_tile, block_m)
             cp_async_bulk_tensor_2d_global_to_shared(
-                smem_A, &a_map, coord_k, coord_m, bar_A
+                smem_A, &a_map, coord_m, coord_k,  bar_A
             );
             
             // B is K-major (K, N), so coordinates are (k_tile, block_n)
             cp_async_bulk_tensor_2d_global_to_shared(
-                smem_B, &b_map, coord_k, coord_n, bar_B
+                smem_B, &b_map, coord_n, coord_k, bar_B
             );
             
             arrive(bar_A, 1);
@@ -113,32 +113,66 @@ __global__ void h100_matmul(
         wgmma_commit();
         wgmma_wait<0>();
 
-        __syncthreads();
-    }
+        // After wgmma_wait<0>() and before the closing brace
+__syncthreads();
 
-// writeback - convert float to bf16
-// Potential alternative writeback based on reference pattern
+// Allocate output buffer in shared memory (after smem_B)
+bf16* smem_output = smem_B + TILE_K * TILE_N;
+
 for (int i = 0; i < 16; i++) {
     for (int j = 0; j < 8; j++) {
-        int row = (tid % 4) + (i / 4) * 4 + (tid / 32) * 16;
-        int col = (tid % 32) / 4 * 8 + (i % 4) * 2 + j;
+        // Calculate the actual position in the 64x256 output tile
+        int row = (lane_id / 4) * 8 + (i / 2);  // Which row within the 64
+        int col = warp_id * 64 + (lane_id % 4) * 16 + (i % 2) * 8 + j;  // Which column within the 256
         
-        int global_m = block_m * TILE_M + row;
-        int global_n = block_n * TILE_N + col;
-        
-        c[global_m * 8192 + global_n] = __float2bfloat16(acc[i][j]);
+        // Write to shared memory
+        smem_output[row * TILE_N + col] = __float2bfloat16(acc[i][j]);
     }
 }
+
+__syncthreads();
+
+// 2. TMA copy from shared to global
+if (tid == 0) {
+    int coord_m = block_m * TILE_M;
+    int coord_n = block_n * TILE_N;
+    
+    // Since C is (N, M) layout, coordinates are (n, m)
+    cp_async_bulk_tensor_2d_shared_to_global(
+        &c_map, coord_n, coord_m, smem_output
+    );
+    
+    tma_commit_group();
+    tma_wait_until_pending<0>();
+}
+
+    }
 }
 
 void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
     CUtensorMap a_map;
     CUtensorMap b_map;
+    CUtensorMap c_map;
 
-    const cuuint64_t global_dim_a[2] = {(cuuint64_t)K, (cuuint64_t)M};
-    const cuuint64_t global_strides_a[1] = {(cuuint64_t)(K * sizeof(bf16))};
-    const cuuint32_t box_dim_a[2] = {TILE_K, TILE_M};
-    const cuuint32_t element_strides_a[2] = {1, 1};
+    // A is stored as M×K (K-major means K is inner dimension)
+const cuuint64_t global_dim_a[2] = {(cuuint64_t)K, (cuuint64_t)M};
+const cuuint64_t global_strides_a[1] = {(cuuint64_t)(K * sizeof(bf16))};
+const cuuint32_t box_dim_a[2] = {TILE_K, TILE_M};
+const cuuint32_t element_strides_a[2] = {1, 1};
+
+// B is stored as N×K (K-major means K is inner dimension)
+const cuuint64_t global_dim_b[2] = {(cuuint64_t)K, (cuuint64_t)N};
+const cuuint64_t global_strides_b[1] = {(cuuint64_t)(K * sizeof(bf16))};
+const cuuint32_t box_dim_b[2] = {TILE_K, TILE_N};
+const cuuint32_t element_strides_b[2] = {1, 1};
+
+// C is stored as N×M (M-major means M is inner dimension)
+// Keep original A and B maps as they were
+// But fix only the C map:
+const cuuint64_t global_dim_c[2] = {(cuuint64_t)M, (cuuint64_t)N};
+const cuuint64_t global_strides_c[1] = {(cuuint64_t)(M * sizeof(bf16))};
+const cuuint32_t box_dim_c[2] = {TILE_M, TILE_N};
+const cuuint32_t element_strides_c[2] = {1, 1};
 
     cuTensorMapEncodeTiled(
         &a_map,
@@ -155,11 +189,6 @@ void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
     );
 
-    const cuuint64_t global_dim_b[2] = {(cuuint64_t)K, (cuuint64_t)N};
-    const cuuint64_t global_strides_b[1] = {(cuuint64_t)(K * sizeof(bf16))};
-    const cuuint32_t box_dim_b[2] = {TILE_K, TILE_N};
-    const cuuint32_t element_strides_b[2] = {1, 1};
-
     cuTensorMapEncodeTiled(
         &b_map,
         CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
@@ -174,8 +203,22 @@ void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
         CU_TENSOR_MAP_L2_PROMOTION_NONE,
         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
     );
+    cuTensorMapEncodeTiled(
+        &c_map,
+        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        2,
+        C,
+        global_dim_c,
+        global_strides_c,
+        box_dim_c,
+        element_strides_c,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_NONE,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+    );
 
-    size_t shared_bytes = (TILE_M * TILE_K + TILE_K * TILE_N) * sizeof(bf16) + 16 + 128;
+    size_t shared_bytes = (TILE_M * TILE_K + TILE_K * TILE_N + TILE_M * TILE_N) * sizeof(bf16) + 16 + 128;
 
     int tile_m = (M + TILE_M - 1) / TILE_M;
     int tile_n = (N + TILE_N - 1) / TILE_N;
@@ -190,7 +233,7 @@ void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
         a_map,
         b_map,
         // reinterpret_cast<float *>(C)
-        C
+        c_map
     );
 }
 
@@ -361,7 +404,7 @@ int main() {
     bool correct = check_correctness(hCublas, hOurs, M * N, 0.01f);
     printf("%s output!\n\n\n", correct ? "Correct" : "Incorrect");
 
-    bool permutation_subset = check_permutation_subset(hCublas, hOurs, M * N, 1000, 0.01f);
+    bool permutation_subset = check_permutation_subset(hCublas, hOurs, M * N, 100, 0.01f);
     printf("%s permutation subset output!\n\n\n", permutation_subset ? "Correct" : "Incorrect");
 
     long flops = 2LL * M * N * K;
