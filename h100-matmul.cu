@@ -16,14 +16,14 @@ typedef __nv_bfloat16 bf16;
 // Part 1: Matrix Multiplication for M = 8192, N = 8192, K = 8192
 ////////////////////////////////////////////////////////////////////////////////
 #define THREADS_PER_BLOCK 128
-#define TILE_M 128
+#define TILE_M 64
 #define TILE_N 256
 #define TILE_K 64
 
 __global__ void h100_matmul(
     __grid_constant__ const CUtensorMap a_map,
     __grid_constant__ const CUtensorMap b_map,
-    float *c
+    bf16 *c
 ) {
     extern __shared__ uint8_t shmem[];
 
@@ -97,6 +97,19 @@ __global__ void h100_matmul(
         uint64_t desc_b = make_smem_desc<SWIZZLE_128B>(smem_B, 0, 0);
 
         wgmma_n256<1, 1, 1, 0, 0>(desc_a, desc_b, acc);
+
+        uint64_t desc_a2 = make_smem_desc<SWIZZLE_128B>(smem_A + 16, 0, 512);
+        uint64_t desc_b2 = make_smem_desc<SWIZZLE_128B>(smem_B + 16, 0, 0);
+        wgmma_n256<1, 1, 1, 0, 0>(desc_a2, desc_b2, acc);
+
+        uint64_t desc_a3 = make_smem_desc<SWIZZLE_128B>(smem_A + 32, 0, 512);
+        uint64_t desc_b3 = make_smem_desc<SWIZZLE_128B>(smem_B + 32, 0, 0);
+        wgmma_n256<1, 1, 1, 0, 0>(desc_a3, desc_b3, acc);
+
+        uint64_t desc_a4 = make_smem_desc<SWIZZLE_128B>(smem_A + 48, 0, 512);
+        uint64_t desc_b4 = make_smem_desc<SWIZZLE_128B>(smem_B + 48, 0, 0);
+        wgmma_n256<1, 1, 1, 0, 0>(desc_a4, desc_b4, acc);
+
         wgmma_commit();
         wgmma_wait<0>();
 
@@ -104,6 +117,19 @@ __global__ void h100_matmul(
     }
 
     // writeback
+// writeback - convert float to bf16
+for (int i = 0; i < 16; i++) {
+    for (int j = 0; j < 8; j++) {
+        int local_row = (tid % 4) * 16 + i;
+        int local_col = (tid / 4) * 8 + j;
+        
+        int global_m = block_m * TILE_M + local_row;
+        int global_n = block_n * TILE_N + local_col;
+        
+        // Convert float to bf16 before writing
+        c[global_m * 8192 + global_n] = __float2bfloat16(acc[i][j]);
+    }
+}
 }
 
 void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
@@ -164,7 +190,8 @@ void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
     h100_matmul<<<grid, THREADS_PER_BLOCK, shared_bytes>>>(
         a_map,
         b_map,
-        reinterpret_cast<float *>(C)
+        // reinterpret_cast<float *>(C)
+        C
     );
 }
 
