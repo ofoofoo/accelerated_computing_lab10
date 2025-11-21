@@ -15,116 +15,158 @@ typedef __nv_bfloat16 bf16;
 ////////////////////////////////////////////////////////////////////////////////
 // Part 1: Matrix Multiplication for M = 8192, N = 8192, K = 8192
 ////////////////////////////////////////////////////////////////////////////////
-#define THREADS_PER_BLOCK 128
 #define TILE_M 64
 #define TILE_N 256
 #define TILE_K 64
 #define MMA_TILE_K 16
+#define TILE_SZ_BYTES ((TILE_M * TILE_K) + (TILE_K * TILE_N)) * sizeof(bf16)
+#define PRODUCER_THREADS 128
+#define NUM_THREADS 256
+#define BARRIER_SIZE_BYTES 8
 
 __global__ void h100_matmul(
     __grid_constant__ const CUtensorMap a_map,
     __grid_constant__ const CUtensorMap b_map,
-    bf16 *c
+    bf16 *C, int M, int N, int K
 ) {
-    extern __shared__ uint8_t shmem[];
+    extern __shared__ char smem_buffer[];
 
-    uint64_t* bar_A = reinterpret_cast<uint64_t*>(shmem);
-    uint64_t* bar_B = reinterpret_cast<uint64_t*>(shmem + 8);
-    
-    uintptr_t tensor_base = reinterpret_cast<uintptr_t>(shmem + 16);
-    tensor_base = (tensor_base + 127) & ~127ULL;
-    
-    bf16* smem_A = reinterpret_cast<bf16*>(tensor_base);
-    bf16* smem_B = smem_A + TILE_M * TILE_K;
+    // Double buffer layout
+    bf16* tile_buffer0 = reinterpret_cast<bf16*>(smem_buffer);
+    bf16* tile_buffer1 = reinterpret_cast<bf16*>(smem_buffer + TILE_SZ_BYTES);
 
-    int tid = threadIdx.x;
-    int warp_id = tid / 32;
-    int lane_id = tid % 32;
+    bf16* buf0_A = tile_buffer0;
+    bf16* buf0_B = tile_buffer0 + (TILE_M * TILE_K);
+    bf16* buf1_A = tile_buffer1;
+    bf16* buf1_B = tile_buffer1 + (TILE_M * TILE_K);
 
-    int block_m = blockIdx.y;
-    int block_n = blockIdx.x;
+    uint32_t tile_m = blockIdx.y * TILE_M;
+    uint32_t tile_n = blockIdx.x * TILE_N;
 
-    if (tid == 0) {
-        init_barrier(bar_A, 1);
-        init_barrier(bar_B, 1);
+    // Barriers after double buffer
+    size_t barrier_start = TILE_SZ_BYTES * 2;
+    uint64_t* prod_bar0 = reinterpret_cast<uint64_t*>(
+        smem_buffer + barrier_start + 0 * BARRIER_SIZE_BYTES);
+    uint64_t* cons_bar0 = reinterpret_cast<uint64_t*>(
+        smem_buffer + barrier_start + 1 * BARRIER_SIZE_BYTES);
+    uint64_t* prod_bar1 = reinterpret_cast<uint64_t*>(
+        smem_buffer + barrier_start + 2 * BARRIER_SIZE_BYTES);
+    uint64_t* cons_bar1 = reinterpret_cast<uint64_t*>(
+        smem_buffer + barrier_start + 3 * BARRIER_SIZE_BYTES);
+
+    if (threadIdx.x == 0) {
+        init_barrier(prod_bar0, 1);
+        init_barrier(cons_bar0, PRODUCER_THREADS);
+        init_barrier(prod_bar1, 1);
+        init_barrier(cons_bar1, PRODUCER_THREADS);
     }
     __syncthreads();
 
-    float acc[16][8];
-    for (int i = 0; i < 16; i++) {
-        for (int j = 0; j < 8; j++) {
-            acc[i][j] = 0.0f;
-        }
-    }
+    bool is_producer = (threadIdx.x < PRODUCER_THREADS);
+    uint32_t phase = 0;
 
-    int num_k_tiles = 8192 / TILE_K;
-    int phase_A = 0;
-    int phase_B = 0;
-    
-    for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) {
-        if (tid == 0) {
-            expect_bytes(bar_A, TILE_M * TILE_K * sizeof(bf16));
-            expect_bytes(bar_B, TILE_K * TILE_N * sizeof(bf16));
+    float accum[16][8] = {0.0f};
 
-            int coord_k = k_tile * TILE_K;
-            int coord_m = block_m * TILE_M;
-            int coord_n = block_n * TILE_N;
-            
-            // A is K-major (K, M), so coordinates are (k, m)
+    if (is_producer && threadIdx.x == 0) {
+        for (uint32_t tile_pair = 0; tile_pair < (K / TILE_K) / 2; tile_pair++) {
+            uint32_t tile0_k = 2 * tile_pair * TILE_K;
+            uint32_t tile1_k = (2 * tile_pair + 1) * TILE_K;
+
+            // Load into buffer 0
+            wait(cons_bar0, phase);
+            expect_bytes_and_arrive(prod_bar0, TILE_SZ_BYTES);
+            async_proxy_fence();
+
             cp_async_bulk_tensor_2d_global_to_shared(
-                smem_A, &a_map, coord_k, coord_m, bar_A
+                buf0_A, &a_map, tile0_k, tile_m, prod_bar0
             );
-            
-            // B is K-major (K, N), so coordinates are (k, n)
             cp_async_bulk_tensor_2d_global_to_shared(
-                smem_B, &b_map, coord_k, coord_n, bar_B
+                buf0_B, &b_map, tile0_k, tile_n, prod_bar0
             );
+
+            // Load into buffer 1
+            wait(cons_bar1, phase);
+            expect_bytes_and_arrive(prod_bar1, TILE_SZ_BYTES);
+            async_proxy_fence();
+
+            cp_async_bulk_tensor_2d_global_to_shared(
+                buf1_A, &a_map, tile1_k, tile_m, prod_bar1
+            );
+            cp_async_bulk_tensor_2d_global_to_shared(
+                buf1_B, &b_map, tile1_k, tile_n, prod_bar1
+            );
+
+            phase = 1 - phase;
+        }
+    } else if (!is_producer) {
+        // CONSUMER: Compute threads
+        uint32_t warp_id = (threadIdx.x - PRODUCER_THREADS) / 32;
+        uint32_t lane_id = threadIdx.x % 32;
+
+        // Signal initial readiness
+        arrive(cons_bar0, 1);
+        arrive(cons_bar1, 1);
+        async_proxy_fence();
+
+        // Process tile pairs
+        for (uint32_t tile_pair = 0; tile_pair < (K / TILE_K) / 2; tile_pair++) {
+            // Process buffer 0
+            wait(prod_bar0, phase);
+            warpgroup_arrive();
             
-            arrive(bar_A, 1);
-            arrive(bar_B, 1);
+            for (int i = 0; i < TILE_K / MMA_TILE_K; i++) {
+                uint64_t desc_a = make_smem_desc<SWIZZLE_128B>(
+                    buf0_A + i * MMA_TILE_K, 8 * 128, 8 * 128
+                );
+                uint64_t desc_b = make_smem_desc<SWIZZLE_128B>(
+                    buf0_B + i * MMA_TILE_K, 8 * 128, 8 * 128
+                );
+                wgmma_n256<1, 1, 1, 0, 0>(desc_a, desc_b, accum);
+            }
+
+            wgmma_commit();
+            wgmma_wait<0>();
+            arrive(cons_bar0, 1);
+            async_proxy_fence();
+
+            // Process buffer 1
+            wait(prod_bar1, phase);
+            warpgroup_arrive();
+            
+            for (int i = 0; i < TILE_K / MMA_TILE_K; i++) {
+                uint64_t desc_a = make_smem_desc<SWIZZLE_128B>(
+                    buf1_A + i * MMA_TILE_K, 8 * 128, 8 * 128
+                );
+                uint64_t desc_b = make_smem_desc<SWIZZLE_128B>(
+                    buf1_B + i * MMA_TILE_K, 8 * 128, 8 * 128
+                );
+                wgmma_n256<1, 1, 1, 0, 0>(desc_a, desc_b, accum);
+            }
+
+            wgmma_commit();
+            wgmma_wait<0>();
+            arrive(cons_bar1, 1);
+            async_proxy_fence();
+
+            phase = 1 - phase;
         }
 
-        wait(bar_A, phase_A);
-        wait(bar_B, phase_B);
-        
-        phase_A ^= 1;
-        phase_B ^= 1;
+        // Store results
+        uint32_t base_m = tile_m + 16 * warp_id + (lane_id / 4);
+        uint32_t base_n = tile_n + 2 * (lane_id % 4);
 
-        __syncthreads();
-        warpgroup_arrive();
+        for (int i = 0; i < 32; i++) {
+            int base_idx = i * 4;
+            int r0 = (base_idx + 0) / 8, c0 = (base_idx + 0) % 8;
+            int r1 = (base_idx + 1) / 8, c1 = (base_idx + 1) % 8;
+            int r2 = (base_idx + 2) / 8, c2 = (base_idx + 2) % 8;
+            int r3 = (base_idx + 3) / 8, c3 = (base_idx + 3) % 8;
 
-        // For TILE_M=64, TILE_K=64: stride = TILE_K * sizeof(bf16) = 64 * 2 = 128 bytes
-        // For TILE_N=256, TILE_K=64: stride = TILE_K * sizeof(bf16) = 64 * 2 = 128 bytes
-        for (int k_chunk = 0; k_chunk < TILE_K / MMA_TILE_K; k_chunk++) {
-            // Each WGMMA processes MMA_TILE_K=16 elements in the K dimension
-            bf16* smem_A_chunk = smem_A + k_chunk * MMA_TILE_K;
-            bf16* smem_B_chunk = smem_B + k_chunk * MMA_TILE_K;
-            uint64_t desc_a = make_smem_desc<SWIZZLE_128B>(smem_A_chunk, 0, 8 * 128);
-            uint64_t desc_b = make_smem_desc<SWIZZLE_128B>(smem_B_chunk, 0, 8 * 128);
-            wgmma_n256<1, 1, 1, 0, 0>(desc_a, desc_b, acc);
+            C[(base_n + i * 8) * M + base_m] = __float2bfloat16(accum[r0][c0]);
+            C[(base_n + i * 8 + 1) * M + base_m] = __float2bfloat16(accum[r1][c1]);
+            C[(base_n + i * 8) * M + (base_m + 8)] = __float2bfloat16(accum[r2][c2]);
+            C[(base_n + i * 8 + 1) * M + (base_m + 8)] = __float2bfloat16(accum[r3][c3]);
         }
-
-        wgmma_commit();
-        wgmma_wait<0>();
-    }
-    
-    int tile_m = block_m * TILE_M;
-    int tile_n = block_n * TILE_N;
-    uint32_t base_m = tile_m + 16 * warp_id + (lane_id / 4);
-    uint32_t base_n = tile_n + 2 * (lane_id % 4);
-
-    for (int i = 0; i < 32; i++)
-    {
-      int base_idx = i * 4;
-      int r0 = (base_idx + 0) / 8, c0 = (base_idx + 0) % 8;
-      int r1 = (base_idx + 1) / 8, c1 = (base_idx + 1) % 8;
-      int r2 = (base_idx + 2) / 8, c2 = (base_idx + 2) % 8;
-      int r3 = (base_idx + 3) / 8, c3 = (base_idx + 3) % 8;
-
-      c[(base_n + i * 8) * 8192 + base_m] = __float2bfloat16(acc[r0][c0]);
-      c[(base_n + i * 8 + 1) * 8192 + base_m] = __float2bfloat16(acc[r1][c1]);
-      c[(base_n + i * 8) * 8192 + (base_m + 8)] = __float2bfloat16(acc[r2][c2]);
-      c[(base_n + i * 8 + 1) * 8192 + (base_m + 8)] = __float2bfloat16(acc[r3][c3]);
     }
 }
 
@@ -132,64 +174,40 @@ void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
     CUtensorMap a_map;
     CUtensorMap b_map;
 
-    // A is stored as M×K (K-major means K is inner dimension)
-    const cuuint64_t global_dim_a[2] = {(cuuint64_t)K, (cuuint64_t)M};
-    const cuuint64_t global_strides_a[1] = {(cuuint64_t)(K * sizeof(bf16))};
-    const cuuint32_t box_dim_a[2] = {TILE_K, TILE_M};
-    const cuuint32_t element_strides_a[2] = {1, 1};
+    // A TMA map (K, M)
+    const cuuint64_t a_globalDim[2] = {K, M};
+    const cuuint64_t a_globalStrides[1] = {K * sizeof(bf16)};
+    uint32_t a_boxDim[2] = {TILE_K, TILE_M};
+    uint32_t a_elementStrides[2] = {1, 1};
 
-    // B is stored as N×K (K-major means K is inner dimension)
-    const cuuint64_t global_dim_b[2] = {(cuuint64_t)K, (cuuint64_t)N};
-    const cuuint64_t global_strides_b[1] = {(cuuint64_t)(K * sizeof(bf16))};
-    const cuuint32_t box_dim_b[2] = {TILE_K, TILE_N};
-    const cuuint32_t element_strides_b[2] = {1, 1};
+    CUDA_CHECK(cuTensorMapEncodeTiled(
+        &a_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, A, a_globalDim,
+        a_globalStrides, a_boxDim, a_elementStrides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
 
-    cuTensorMapEncodeTiled(
-        &a_map,
-        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-        2,
-        A,
-        global_dim_a,
-        global_strides_a,
-        box_dim_a,
-        element_strides_a,
-        CU_TENSOR_MAP_INTERLEAVE_NONE,
-        CU_TENSOR_MAP_SWIZZLE_128B,
-        CU_TENSOR_MAP_L2_PROMOTION_NONE,
-        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
-    );
+    // B TMA map (K, N)
+    const cuuint64_t b_globalDim[2] = {K, N};
+    const cuuint64_t b_globalStrides[1] = {K * sizeof(bf16)};
+    uint32_t b_boxDim[2] = {TILE_K, TILE_N};
+    uint32_t b_elementStrides[2] = {1, 1};
 
-    cuTensorMapEncodeTiled(
-        &b_map,
-        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-        2,
-        B,
-        global_dim_b,
-        global_strides_b,
-        box_dim_b,
-        element_strides_b,
-        CU_TENSOR_MAP_INTERLEAVE_NONE,
-        CU_TENSOR_MAP_SWIZZLE_128B,
-        CU_TENSOR_MAP_L2_PROMOTION_NONE,
-        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
-    );
+    CUDA_CHECK(cuTensorMapEncodeTiled(
+        &b_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, B, b_globalDim,
+        b_globalStrides, b_boxDim, b_elementStrides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
 
-    size_t shared_bytes = (TILE_M * TILE_K + TILE_K * TILE_N) * sizeof(bf16) + 16 + 128;
-
-    int tile_m = (M + TILE_M - 1) / TILE_M;
-    int tile_n = (N + TILE_N - 1) / TILE_N;
-    dim3 grid(tile_n, tile_m);
-
+    dim3 num_blocks((N + TILE_N - 1) / TILE_N, (M + TILE_M - 1) / TILE_M, 1);
+    size_t shared_mem_size = TILE_SZ_BYTES * 2 + BARRIER_SIZE_BYTES * 4;
+    
     CUDA_CHECK(cudaFuncSetAttribute(
         h100_matmul,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
-        shared_bytes));
+        shared_mem_size));
     
-    h100_matmul<<<grid, THREADS_PER_BLOCK, shared_bytes>>>(
-        a_map,
-        b_map,
-        C
-    );
+    h100_matmul<<<num_blocks, NUM_THREADS, shared_mem_size>>>(
+        a_map, b_map, C, M, N, K);
 }
 
 // each block does 64x256 output tile, similar to lab 4
