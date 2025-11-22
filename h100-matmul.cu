@@ -20,13 +20,14 @@ typedef __nv_bfloat16 bf16;
 #define TILE_K 64
 #define MMA_TILE_K 16
 #define MMA_TILE_M 64
+#define PIPE_DEPTH 3
 
 #define TILE_SZ_BYTES ((TILE_M * TILE_K) + (TILE_K * TILE_N)) * sizeof(bf16)
 #define OUT_TILE_SZ_BYTES (TILE_M * TILE_N * sizeof(bf16))
 #define CONSUMER_THREADS_PER_GROUP 128
 #define NUM_CONSUMER_GROUPS 2
 #define CONSUMER_THREADS (NUM_CONSUMER_GROUPS * CONSUMER_THREADS_PER_GROUP)
-#define NUM_THREADS (CONSUMER_THREADS + 1)  // 1 producer thread
+#define NUM_THREADS (CONSUMER_THREADS + 1)
 #define BARRIER_SIZE_BYTES 8
 
 __device__ __forceinline__ int32_t swizzle_128b(int32_t row, int32_t col) {
@@ -39,78 +40,61 @@ __global__ void __launch_bounds__(NUM_THREADS, 1) h100_matmul(
     __grid_constant__ const CUtensorMap c_map,
     int M, int N, int K
 ) {
-    extern __shared__ char smem_buffer[];
+    extern __shared__ __align__(1024) char smem_buffer[];
+    __shared__ __align__(8) uint64_t prod_bar[PIPE_DEPTH];
+    __shared__ __align__(8) uint64_t cons_bar[PIPE_DEPTH];
 
-    bf16* tile_buffer0 = reinterpret_cast<bf16*>(smem_buffer);
-    bf16* tile_buffer1 = reinterpret_cast<bf16*>(smem_buffer + TILE_SZ_BYTES);
-    bf16* output_tile = reinterpret_cast<bf16*>(smem_buffer + TILE_SZ_BYTES * 2);
-
-    bf16* buf0_A = tile_buffer0;
-    bf16* buf0_B = tile_buffer0 + (TILE_M * TILE_K);
-    bf16* buf1_A = tile_buffer1;
-    bf16* buf1_B = tile_buffer1 + (TILE_M * TILE_K);
+    bf16* tile_buffers[PIPE_DEPTH];
+    bf16* buf_A[PIPE_DEPTH];
+    bf16* buf_B[PIPE_DEPTH];
+    
+    for (int i = 0; i < PIPE_DEPTH; i++) {
+        tile_buffers[i] = reinterpret_cast<bf16*>(smem_buffer + i * TILE_SZ_BYTES);
+        buf_A[i] = tile_buffers[i];
+        buf_B[i] = tile_buffers[i] + (TILE_M * TILE_K);
+    }
+    
+    bf16* output_tile = reinterpret_cast<bf16*>(smem_buffer + PIPE_DEPTH * TILE_SZ_BYTES);
 
     uint32_t tile_m = blockIdx.y * TILE_M;
     uint32_t tile_n = blockIdx.x * TILE_N;
 
-    size_t barrier_start = TILE_SZ_BYTES * 2 + OUT_TILE_SZ_BYTES;
-    uint64_t* prod_bar0 = reinterpret_cast<uint64_t*>(
-        smem_buffer + barrier_start + 0 * BARRIER_SIZE_BYTES);
-    uint64_t* cons_bar0 = reinterpret_cast<uint64_t*>(
-        smem_buffer + barrier_start + 1 * BARRIER_SIZE_BYTES);
-    uint64_t* prod_bar1 = reinterpret_cast<uint64_t*>(
-        smem_buffer + barrier_start + 2 * BARRIER_SIZE_BYTES);
-    uint64_t* cons_bar1 = reinterpret_cast<uint64_t*>(
-        smem_buffer + barrier_start + 3 * BARRIER_SIZE_BYTES);
-
     bool is_producer = (threadIdx.x == CONSUMER_THREADS);
-
     if (threadIdx.x == 0) {
-        init_barrier(prod_bar0, 1);
-        init_barrier(cons_bar0, CONSUMER_THREADS);
-        init_barrier(prod_bar1, 1);
-        init_barrier(cons_bar1, CONSUMER_THREADS);
+        for (int i = 0; i < PIPE_DEPTH; i++) {
+            init_barrier(&prod_bar[i], 1);
+            init_barrier(&cons_bar[i], CONSUMER_THREADS);
+        }
     }
     __syncthreads();
 
+    int32_t pipe_idx = 0;
     uint32_t phase = 0;
+    const int32_t num_k_tiles = K / TILE_K;
 
     if (is_producer) {
-        // Reduce register pressure for producer
         warpgroup_reg_dealloc<24>();
 
-        for (uint32_t tile_pair = 0; tile_pair < (K / TILE_K) / 2; tile_pair++) {
-            uint32_t tile0_k = 2 * tile_pair * TILE_K;
-            uint32_t tile1_k = (2 * tile_pair + 1) * TILE_K;
+        for (int32_t k_tile = 0; k_tile < num_k_tiles; k_tile++, pipe_idx++) {
+            if (pipe_idx == PIPE_DEPTH) {
+                pipe_idx = 0;
+                phase ^= 1;
+            }
 
-            // Load buffer 0
-            wait(cons_bar0, phase);
-            expect_bytes_and_arrive(prod_bar0, TILE_SZ_BYTES);
+            uint32_t tile_k = k_tile * TILE_K;
+
+            wait(&cons_bar[pipe_idx], phase);
+            expect_bytes_and_arrive(&prod_bar[pipe_idx], TILE_SZ_BYTES);
             async_proxy_fence();
 
             cp_async_bulk_tensor_2d_global_to_shared(
-                buf0_A, &a_map, tile0_k, tile_m, prod_bar0
+                buf_A[pipe_idx], &a_map, tile_k, tile_m, &prod_bar[pipe_idx]
             );
             cp_async_bulk_tensor_2d_global_to_shared(
-                buf0_B, &b_map, tile0_k, tile_n, prod_bar0
+                buf_B[pipe_idx], &b_map, tile_k, tile_n, &prod_bar[pipe_idx]
             );
-
-            // Load buffer 1
-            wait(cons_bar1, phase);
-            expect_bytes_and_arrive(prod_bar1, TILE_SZ_BYTES);
-            async_proxy_fence();
-
-            cp_async_bulk_tensor_2d_global_to_shared(
-                buf1_A, &a_map, tile1_k, tile_m, prod_bar1
-            );
-            cp_async_bulk_tensor_2d_global_to_shared(
-                buf1_B, &b_map, tile1_k, tile_n, prod_bar1
-            );
-
-            phase = 1 - phase;
         }
     } else {
-        // Allocate registers for WGMMA accumulation
         warpgroup_reg_alloc<160>();
 
         uint32_t consumer_wg_id = threadIdx.x / CONSUMER_THREADS_PER_GROUP;
@@ -118,63 +102,77 @@ __global__ void __launch_bounds__(NUM_THREADS, 1) h100_matmul(
         uint32_t warp_id = local_thread_id / 32;
         uint32_t lane_id = threadIdx.x % 32;
 
-        // Each warpgroup operates on its own M-slice
-        bf16* wg_buf0_A = buf0_A + consumer_wg_id * MMA_TILE_M * TILE_K;
-        bf16* wg_buf1_A = buf1_A + consumer_wg_id * MMA_TILE_M * TILE_K;
-
         float accum[16][8];
         memset(accum, 0, sizeof(accum));
 
-        // Signal initial readiness
-        arrive(cons_bar0, 1);
-        arrive(cons_bar1, 1);
+        for (int i = 0; i < PIPE_DEPTH; i++) {
+            arrive(&cons_bar[i], 1);
+        }
         async_proxy_fence();
 
-        for (uint32_t tile_pair = 0; tile_pair < (K / TILE_K) / 2; tile_pair++) {
-            // Process buffer 0
-            wait(prod_bar0, phase);
+        for (int32_t k_tile = 0; k_tile < 1 && k_tile < num_k_tiles; 
+             k_tile++, pipe_idx++) {
+            if (pipe_idx == PIPE_DEPTH) {
+                pipe_idx = 0;
+                phase ^= 1;
+            }
+
+            bf16* wg_buf_A = buf_A[pipe_idx] + consumer_wg_id * MMA_TILE_M * TILE_K;
+
+            wait(&prod_bar[pipe_idx], phase);
             warpgroup_arrive();
-            
-            for (int i = 0; i < TILE_K / MMA_TILE_K; i++) {
-                uint64_t desc_a = make_smem_desc<SWIZZLE_128B>(
-                    wg_buf0_A + i * MMA_TILE_K, 8 * 128, 8 * 128
-                );
-                uint64_t desc_b = make_smem_desc<SWIZZLE_128B>(
-                    buf0_B + i * MMA_TILE_K, 8 * 128, 8 * 128
-                );
-                wgmma_n256<1, 1, 1, 0, 0>(desc_a, desc_b, accum);
+
+            const uint64_t desc_a = make_smem_desc<SWIZZLE_128B>(wg_buf_A, 1, 1024);
+            const uint64_t desc_b = make_smem_desc<SWIZZLE_128B>(buf_B[pipe_idx], 1, 1024);
+
+            wgmma_n256<0, 1, 1, 0, 0>(desc_a, desc_b, accum);
+            for (int j = 1; j < TILE_K / MMA_TILE_K; j++) {
+                wgmma_n256<1, 1, 1, 0, 0>(
+                    desc_a + j * sizeof(bf16),
+                    desc_b + j * sizeof(bf16), 
+                    accum);
             }
 
             wgmma_commit();
             wgmma_wait<0>();
-            arrive(cons_bar0, 1);
+            arrive(&cons_bar[pipe_idx], 1);
             async_proxy_fence();
-
-            // Process buffer 1
-            wait(prod_bar1, phase);
-            warpgroup_arrive();
-            
-            for (int i = 0; i < TILE_K / MMA_TILE_K; i++) {
-                uint64_t desc_a = make_smem_desc<SWIZZLE_128B>(
-                    wg_buf1_A + i * MMA_TILE_K, 8 * 128, 8 * 128
-                );
-                uint64_t desc_b = make_smem_desc<SWIZZLE_128B>(
-                    buf1_B + i * MMA_TILE_K, 8 * 128, 8 * 128
-                );
-                wgmma_n256<1, 1, 1, 0, 0>(desc_a, desc_b, accum);
-            }
-
-            wgmma_commit();
-            wgmma_wait<0>();
-            arrive(cons_bar1, 1);
-            async_proxy_fence();
-
-            phase = 1 - phase;
         }
 
-        // Store to shared memory with swizzling
+        // Main loop - accumulate (all with wgmma_n256<1,...>)
+        #pragma unroll 32
+        for (int32_t k_tile = 1; k_tile < num_k_tiles; k_tile++, pipe_idx++) {
+            if (pipe_idx == PIPE_DEPTH) {
+                pipe_idx = 0;
+                phase ^= 1;
+            }
+
+            bf16* wg_buf_A = buf_A[pipe_idx] + consumer_wg_id * MMA_TILE_M * TILE_K;
+
+            wait(&prod_bar[pipe_idx], phase);
+            warpgroup_arrive();
+
+            const uint64_t desc_a = make_smem_desc<SWIZZLE_128B>(wg_buf_A, 1, 1024);
+            const uint64_t desc_b = make_smem_desc<SWIZZLE_128B>(buf_B[pipe_idx], 1, 1024);
+
+            for (int j = 0; j < TILE_K / MMA_TILE_K; j++) {
+                wgmma_n256<1, 1, 1, 0, 0>(
+                    desc_a + j * sizeof(bf16),
+                    desc_b + j * sizeof(bf16), 
+                    accum);
+            }
+
+            wgmma_commit();
+            wgmma_wait<0>();
+            arrive(&cons_bar[pipe_idx], 1);
+            async_proxy_fence();
+        }
+
         uint32_t local_m = 16 * warp_id + (lane_id / 4);
         uint32_t local_n = 2 * (lane_id % 4);
+
+        // Wait for any pending TMA operations before writing to shared memory
+        tma_wait_until_pending<0>();
 
         for (int i = 0; i < 32; i++) {
             int base_idx = i * 4;
@@ -188,7 +186,6 @@ __global__ void __launch_bounds__(NUM_THREADS, 1) h100_matmul(
             int out_col_0 = local_m;
             int out_col_1 = local_m + 8;
 
-            // Write to warpgroup's slice of output tile
             bf16* wg_output = output_tile + consumer_wg_id * MMA_TILE_M * TILE_N;
             
             wg_output[out_row_0 * MMA_TILE_M + swizzle_128b(out_row_0, out_col_0)] = 
@@ -203,7 +200,6 @@ __global__ void __launch_bounds__(NUM_THREADS, 1) h100_matmul(
 
         __syncthreads();
 
-        // Use TMA to write back (one thread per warpgroup)
         if (local_thread_id == 0) {
             bf16* wg_output = output_tile + consumer_wg_id * MMA_TILE_M * TILE_N;
             uint32_t wg_tile_m = tile_m + consumer_wg_id * MMA_TILE_M;
@@ -211,9 +207,8 @@ __global__ void __launch_bounds__(NUM_THREADS, 1) h100_matmul(
             cp_async_bulk_tensor_2d_shared_to_global(
                 &c_map, wg_tile_m, tile_n, wg_output
             );
+            tma_commit_group();
         }
-
-        tma_commit_group();
     }
 }
 
@@ -257,15 +252,14 @@ void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
         CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
 
     dim3 num_blocks((N + TILE_N - 1) / TILE_N, (M + TILE_M - 1) / TILE_M, 1);
-    size_t shared_mem_size = TILE_SZ_BYTES * 2 + OUT_TILE_SZ_BYTES + BARRIER_SIZE_BYTES * 4;
+    size_t shared_mem_size = PIPE_DEPTH * TILE_SZ_BYTES + OUT_TILE_SZ_BYTES;
     
     CUDA_CHECK(cudaFuncSetAttribute(
         h100_matmul,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         shared_mem_size));
     
-    h100_matmul<<<num_blocks, NUM_THREADS, shared_mem_size>>>(
-        a_map, b_map, c_map, M, N, K);
+    h100_matmul<<<num_blocks, NUM_THREADS, shared_mem_size>>>(a_map, b_map, c_map, M, N, K);
 }
 // each block does 64x256 output tile, similar to lab 4
 // within each block: there are 2 WARPGROUPS: 1 producer 1 consudmer, walk along k dimension
