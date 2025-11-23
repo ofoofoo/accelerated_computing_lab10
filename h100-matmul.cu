@@ -15,6 +15,45 @@ typedef __nv_bfloat16 bf16;
 ////////////////////////////////////////////////////////////////////////////////
 // Part 1: Matrix Multiplication for M = 8192, N = 8192, K = 8192
 ////////////////////////////////////////////////////////////////////////////////
+// Rotate/flip a quadrant appropriately
+__device__ __forceinline__ void hilbert_rot(int n, int *x, int *y, int rx, int ry) {
+    if (ry == 0) {
+        if (rx == 1) {
+            *x = n - 1 - *x;  // Flip x coordinate
+            *y = n - 1 - *y;  // Flip y coordinate
+        }
+        // Swap x and y for the rotation
+        int t = *x;
+        *x = *y;
+        *y = t;
+    }
+}
+
+// Convert Hilbert distance (1D) to 2D (x, y) coordinates
+// n = size of the grid (must be power of 2)
+// d = distance along Hilbert curve
+__device__ __forceinline__ void hilbert_d2xy(int n, int d, int *x, int *y) {
+    int rx, ry, s, t = d;
+    *x = *y = 0;
+    
+    // Iterate through each level of the Hilbert curve
+    for (s = 1; s < n; s *= 2) {
+        rx = 1 & (t / 2);  // Extract bit for x rotation
+        ry = 1 & (t ^ rx); // Extract bit for y rotation
+        hilbert_rot(s, x, y, rx, ry);
+        *x += s * rx;      // Add offset based on quadrant
+        *y += s * ry;
+        t /= 4;            // Move to next level (2 bits)
+    }
+}
+
+// Compute the next power of 2 >= x
+__device__ __forceinline__ int next_power_of_2(int x) {
+    int power = 1;
+    while (power < x) power *= 2;
+    return power;
+}
+
 #define TILE_M 128
 #define TILE_N 256
 #define TILE_K 64
@@ -38,7 +77,8 @@ __global__ void __launch_bounds__(NUM_THREADS, 1) h100_matmul(
     __grid_constant__ const CUtensorMap a_map,
     __grid_constant__ const CUtensorMap b_map,
     __grid_constant__ const CUtensorMap c_map,
-    int M, int N, int K
+    int M, int N, int K,
+    int grid_size_x, int grid_size_y  // Grid dimensions for Hilbert calculation
 ) {
     extern __shared__ __align__(1024) char smem_buffer[];
     __shared__ __align__(8) uint64_t prod_bar[PIPE_DEPTH];
@@ -56,8 +96,27 @@ __global__ void __launch_bounds__(NUM_THREADS, 1) h100_matmul(
     
     bf16* output_tile = reinterpret_cast<bf16*>(smem_buffer + PIPE_DEPTH * TILE_SZ_BYTES);
 
-    uint32_t tile_m = blockIdx.y * TILE_M;
-    uint32_t tile_n = blockIdx.x * TILE_N;
+    // Compute the grid size (must be power of 2 for standard Hilbert curve)
+    int hilbert_n = next_power_of_2(max(grid_size_x, grid_size_y));
+    
+    // Get linear block index in the grid
+    int linear_block_idx = blockIdx.y * gridDim.x + blockIdx.x;
+    
+    // Convert from Hilbert distance to 2D coordinates
+    int hilbert_x, hilbert_y;
+    hilbert_d2xy(hilbert_n, linear_block_idx, &hilbert_x, &hilbert_y);
+    
+    // Bounds check: if Hilbert coordinates exceed actual grid, exit early
+    // This handles non-square grids where some Hilbert curve positions are unused
+    if (hilbert_x >= grid_size_x || hilbert_y >= grid_size_y) {
+        return;
+    }
+    
+    // Use Hilbert coordinates instead of blockIdx.x/y
+    uint32_t tile_m = hilbert_y * TILE_M;
+    uint32_t tile_n = hilbert_x * TILE_N; 
+    // same stuff here
+
 
     bool is_producer = (threadIdx.x == CONSUMER_THREADS);
     if (threadIdx.x == 0) {
@@ -139,7 +198,6 @@ __global__ void __launch_bounds__(NUM_THREADS, 1) h100_matmul(
             async_proxy_fence();
         }
 
-        // Main loop - accumulate (all with wgmma_n256<1,...>)
         #pragma unroll 32
         for (int32_t k_tile = 1; k_tile < num_k_tiles; k_tile++, pipe_idx++) {
             if (pipe_idx == PIPE_DEPTH) {
@@ -171,7 +229,6 @@ __global__ void __launch_bounds__(NUM_THREADS, 1) h100_matmul(
         uint32_t local_m = 16 * warp_id + (lane_id / 4);
         uint32_t local_n = 2 * (lane_id % 4);
 
-        // Wait for any pending TMA operations before writing to shared memory
         tma_wait_until_pending<0>();
 
         for (int i = 0; i < 32; i++) {
@@ -215,7 +272,6 @@ __global__ void __launch_bounds__(NUM_THREADS, 1) h100_matmul(
 void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
     CUtensorMap a_map, b_map, c_map;
 
-    // A TMA map (K, M)
     const cuuint64_t a_globalDim[2] = {K, M};
     const cuuint64_t a_globalStrides[1] = {K * sizeof(bf16)};
     uint32_t a_boxDim[2] = {TILE_K, TILE_M};
@@ -227,7 +283,6 @@ void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
         CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
         CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
 
-    // B TMA map (K, N)
     const cuuint64_t b_globalDim[2] = {K, N};
     const cuuint64_t b_globalStrides[1] = {K * sizeof(bf16)};
     uint32_t b_boxDim[2] = {TILE_K, TILE_N};
@@ -239,7 +294,6 @@ void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
         CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
         CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
 
-    // C TMA map (M, N)
     const cuuint64_t c_globalDim[2] = {M, N};
     const cuuint64_t c_globalStrides[1] = {M * sizeof(bf16)};
     uint32_t c_boxDim[2] = {MMA_TILE_M, TILE_N};
@@ -251,7 +305,20 @@ void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
         CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
         CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
 
-    dim3 num_blocks((N + TILE_N - 1) / TILE_N, (M + TILE_M - 1) / TILE_M, 1);
+    int grid_size_x = (N + TILE_N - 1) / TILE_N;
+    int grid_size_y = (M + TILE_M - 1) / TILE_M;
+    
+    // For Hilbert curve, we need to allocate a power-of-2 grid
+    // This ensures the curve fills the space properly
+    int hilbert_n = 1;
+    while (hilbert_n < max(grid_size_x, grid_size_y)) {
+        hilbert_n *= 2;
+    }
+    
+    // Launch with square grid to cover entire Hilbert curve
+    // Unused blocks will early-exit in the kernel
+    dim3 num_blocks(hilbert_n, hilbert_n, 1);
+    
     size_t shared_mem_size = PIPE_DEPTH * TILE_SZ_BYTES + OUT_TILE_SZ_BYTES;
     
     CUDA_CHECK(cudaFuncSetAttribute(
@@ -259,7 +326,9 @@ void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         shared_mem_size));
     
-    h100_matmul<<<num_blocks, NUM_THREADS, shared_mem_size>>>(a_map, b_map, c_map, M, N, K);
+    h100_matmul<<<num_blocks, NUM_THREADS, shared_mem_size>>>(
+        a_map, b_map, c_map, M, N, K, grid_size_x, grid_size_y
+    );
 }
 // each block does 64x256 output tile, similar to lab 4
 // within each block: there are 2 WARPGROUPS: 1 producer 1 consudmer, walk along k dimension
